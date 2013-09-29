@@ -7,7 +7,7 @@ import os, re, sys
 
 #
 #
-# Retrieve options from cmake 
+# Retrieve options from cmake
 #
 #
 def parse_flags(f, pflags=[]):
@@ -69,7 +69,7 @@ def find_includes(project_path):
     is_path = False
     for option in get_options(project_path):
         if option == '-isystem': is_path = True
-        else: is_path = False 
+        else: is_path = False
         if option.startswith('-I'): result.update(search_include(option[2:]))
         if is_path: result.update(search_include(option))
     project_includes[project_path] = sorted(result)
@@ -145,7 +145,7 @@ clang_error_panel = ClangErrorPanel()
 
 #
 #
-# Get language from sublime 
+# Get language from sublime
 #
 #
 
@@ -261,7 +261,6 @@ class ClangCompleteShowType(sublime_plugin.TextCommand):
 
 class ClangCompleteCompletion(sublime_plugin.EventListener):
     def complete_at(self, view, prefix, location, timeout):
-        print("complete_at", prefix)
         filename = view.file_name()
         if not is_supported_language(view):
             return []
@@ -274,7 +273,7 @@ class ClangCompleteCompletion(sublime_plugin.EventListener):
         return completions;
 
     def diagnostics(self, view):
-        filename = view.file_name()        
+        filename = view.file_name()
         return get_diagnostics(filename, get_args(view))
 
     def show_diagnostics(self, view):
@@ -284,36 +283,33 @@ class ClangCompleteCompletion(sublime_plugin.EventListener):
         if not window is None and len(output) > 1:
             window.run_command("clang_toggle_panel", {"show": True})
 
-
     def on_post_text_command(self, view, name, args):
         if not is_supported_language(view): return
-        
+
         if 'delete' in name: return
-        
+
         # TODO: Adjust position to begining of word boundary
-        pos = view.sel()[0].begin()
-        self.complete_at(view, "", pos, 0)
-        
+        # pos = view.sel()[0].begin()
+        # self.complete_at(view, "", pos, 0)
 
     def on_query_completions(self, view, prefix, locations):
         if not is_supported_language(view):
             return []
-            
-        completions = self.complete_at(view, prefix, locations[0], get_setting(view, "timeout", 200))
-        print("on_query_completions:", prefix, len(completions))
-        if (get_setting(view, "inhibit_sublime_completions", True)):
-            return ([(c, c) for c in completions], sublime.INHIBIT_WORD_COMPLETIONS | sublime.INHIBIT_EXPLICIT_COMPLETIONS)
-        else:
-            return ([(c, c) for c in completions])
 
-    def on_activated_async(self, view):
-        self.complete_at(view, "", view.sel()[0].begin(), 0)
+        completions = self.complete_at(view, prefix, locations[0], get_setting(view, "timeout", 500))
+        if (get_setting(view, "inhibit_sublime_completions", True)):
+            return (completions, sublime.INHIBIT_WORD_COMPLETIONS | sublime.INHIBIT_EXPLICIT_COMPLETIONS)
+        else:
+            return (completions)
+
+    #def on_activated_async(self, view):
+    #    self.complete_at(view, "", view.sel()[0].begin(), 0)
 
     def on_post_save_async(self, view):
         if not is_supported_language(view): return
-        
+
         self.show_diagnostics(view)
-        
+
         pos = view.sel()[0].begin()
         self.complete_at(view, "", pos, 0)
 
