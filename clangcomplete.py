@@ -131,7 +131,7 @@ class ClangErrorPanel(object):
             window = sublime.active_window()
         if not self.is_visible(window):
             self.view = window.get_output_panel("clangcomplete")
-            self.view.settings().set("result_file_regex", "^(..[^:\n]*):([0-9]+):?([0-9]+)?:? (.*)$")
+            self.view.settings().set("result_file_regex", "^[ ]*(..[^:\n]*):([0-9]+):?([0-9]+)?:? (.*)$")
             self.view.set_syntax_file('Packages/ClangComplete/ErrorPanel.tmLanguage')
         self.flush()
 
@@ -309,9 +309,6 @@ class ClangCompleteCompletion(sublime_plugin.EventListener):
         if not is_supported_language(view): return
 
         self.show_diagnostics(view)
-
-        pos = view.sel()[0].begin()
-        self.complete_at(view, "", pos, 0)
 
     def on_close(self, view):
         if is_supported_language(view):

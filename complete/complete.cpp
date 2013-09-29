@@ -14,10 +14,11 @@
 #include <algorithm>
 #include <unordered_map>
 #include <cstring>
+#include <stack>
 
 #include "complete.h"
 
-std::ofstream dump_log("/home/corneliu/clang_log");
+std::ofstream logger("/home/corneliu/clang_log");
 
 namespace std {
 
@@ -144,10 +145,6 @@ class translation_unit
     completion_results(CXCodeCompleteResults* r)
     {
       this->results = std::shared_ptr<CXCodeCompleteResults>(r, &clang_disposeCodeCompleteResults);
-      if (results)
-        dump_log << "Num results: " << results->NumResults << std::endl;
-      else
-        dump_log << "No results" << std::endl;
     }
 
     iterator begin()
@@ -260,10 +257,7 @@ public:
 
     std::string get_type_name()
     {
-      //return to_std_string(clang_getTypeSpelling(clang_getCanonicalType(clang_getCursorType(this->c))));
-      auto res = to_std_string(clang_getTypeSpelling(clang_getCanonicalType(clang_getCursorType(this->c))));
-      dump_log << "Type: " << res << std::endl;
-      return res;
+      return to_std_string(clang_getTypeSpelling(clang_getCanonicalType(clang_getCursorType(this->c))));
     }
 
     CXSourceLocation get_location()
@@ -292,12 +286,6 @@ public:
   };
   translation_unit(const char * filename, const char ** args, int argv) : filename(filename)
   {
-        // this->index = clang_createIndex(1, 1);
-    dump_log << "Parsing translation unit:" << filename << std::endl;
-    std::vector<std::string> vals(args, args + argv);
-    for (auto& v: vals)
-      dump_log << v << " ";
-    dump_log << std::endl;
     this->tu = clang_parseTranslationUnit(get_index(), filename, args, argv, NULL, 0, clang_defaultEditingTranslationUnitOptions());
     detach_async([=]() { this->reparse(); });
   }
@@ -307,7 +295,6 @@ public:
   cursor get_cursor_at(unsigned long line, unsigned long col, const char * name=nullptr)
   {
     if (name == nullptr) name = this->filename.c_str();
-    dump_log << "Get cursor at:" << name << ":" << line << ":" << col << std::endl;
     CXFile f = clang_getFile(this->tu, name);
     CXSourceLocation loc = clang_getLocation(this->tu, f, line, col);
     return cursor(clang_getCursor(this->tu, loc));
@@ -398,18 +385,45 @@ public:
             display << text << " ";
             break;
           default:
-            dump_log << "Kind:" << kind << " Text:" << text << std::endl;
+            logger << "Kind:" << kind << " Text:" << text << std::endl;
         }
       });
-      dump_log << "display:" << display.str() << "\nreplacement:" << replacement.str() << std::endl;
       results.insert(std::make_tuple(display.str(), replacement.str()));
       //if (!text.empty() and starts_with(text.c_str(), prefix)) results.insert(text);
     }
-    dump_log << std::endl;
-        // Perhaps a reparse can help rejuvenate clang?
+    // Perhaps a reparse can help rejuvenate clang?
     if (results.size() == 0) this->unsafe_reparse(buffer, len);
-        // if (buffer != nullptr) dump_log << get_line_at(std::string(buffer, len), line) << std::endl;
     return results;
+  }
+
+  typedef std::shared_ptr<std::remove_pointer<CXDiagnosticSet>::type> DiagnosticSetPtr;
+  typedef std::shared_ptr<std::remove_pointer<CXDiagnostic>::type> DiagnosticPtr;
+
+  void process_diagnostic_set(CXDiagnosticSet set, std::vector<std::string>& results, std::size_t depth = 0) {
+    const std::size_t indent_size = 2;
+    if (!set)
+      return;
+
+    auto num_diagnostics = clang_getNumDiagnosticsInSet(set);
+    for (auto i = 0; i < num_diagnostics; ++i) {
+      auto diag = clang_getDiagnosticInSet(set, i);
+      if (!diag)
+        continue;
+
+      if (clang_getDiagnosticSeverity(diag) != CXDiagnostic_Ignored) {
+        std::stringstream formatter;
+        for (auto i = 0; i < depth; ++i)
+          for (auto j = 0; j < indent_size; ++j)
+            formatter << " ";
+
+        formatter << to_std_string(clang_formatDiagnostic(diag, clang_defaultDiagnosticDisplayOptions()));
+        results.push_back(formatter.str());
+
+        auto child = clang_getChildDiagnostics(diag);
+        if (child)
+          process_diagnostic_set(child, results, depth + 1);
+      }
+    }
   }
 
   std::vector<std::string> get_diagnostics(int timeout=-1)
@@ -423,17 +437,12 @@ public:
     {
       if (!lock.try_lock_for(std::chrono::milliseconds(timeout))) return {};
     }
+
     std::vector<std::string> result;
-    auto n = clang_getNumDiagnostics(this->tu);
-    for(int i=0;i<n;i++)
-    {
-      auto diag = std::shared_ptr<void>(clang_getDiagnostic(this->tu, i), &clang_disposeDiagnostic);
-      if (diag != nullptr and clang_getDiagnosticSeverity(diag.get()) != CXDiagnostic_Ignored)
-      {
-        auto str = clang_formatDiagnostic(diag.get(), clang_defaultDiagnosticDisplayOptions());
-        result.push_back(to_std_string(str));
-      }
-    }
+    auto set = DiagnosticSetPtr(clang_getDiagnosticSetFromTU(this->tu), &clang_disposeDiagnosticSet);
+    process_diagnostic_set(set.get(), result);
+    logger << "Done processing diagnostics" << std::endl;
+
     return result;
   }
 
@@ -441,10 +450,10 @@ public:
     std::lock_guard<std::timed_mutex> lock(this->m);
     std::string result;
     cursor c = this->get_cursor_at(line, col);
-    cursor ref = c.get_reference();
-    if (!ref.is_null())
+    cursor def = c.get_definition();
+    if (!def.is_null())
     {
-      result = ref.get_location_path();
+      result = def.get_location_path();
     }
     else if (c.get_kind() == CXCursor_InclusionDirective)
     {
@@ -623,7 +632,6 @@ extern "C" {
     unsigned len)
   {
     auto tu = get_tu(filename, args, argv);
-    dump_log << "prefix: " << prefix << std::endl;
     return export_tuple_pylist(tu->async_complete_at(line, col, prefix, timeout, buffer, len));
   }
 
