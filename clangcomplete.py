@@ -260,14 +260,15 @@ class ClangCompleteShowType(sublime_plugin.TextCommand):
         sublime.status_message(type)
 
 class ClangCompleteCompletion(sublime_plugin.EventListener):
+    def run(self, edit):
+        print('Run completion');
+
     def complete_at(self, view, prefix, location, timeout):
         filename = view.file_name()
         if not is_supported_language(view):
             return []
 
         row, col = view.rowcol(location - len(prefix))
-
-        # completions = get_completions(filename, get_args(view), row+1, col+1, "", timeout, unsaved_buffer)
         completions = get_completions(filename, get_args(view), row+1, col+1, prefix, timeout, get_unsaved_buffer(view))
 
         return completions;
@@ -288,11 +289,8 @@ class ClangCompleteCompletion(sublime_plugin.EventListener):
 
         if 'delete' in name: return
 
-        # TODO: Adjust position to begining of word boundary
-        # pos = view.sel()[0].begin()
-        # self.complete_at(view, "", pos, 0)
-
     def on_query_completions(self, view, prefix, locations):
+        print('query completions');
         if not is_supported_language(view):
             return []
 
@@ -301,9 +299,6 @@ class ClangCompleteCompletion(sublime_plugin.EventListener):
             return (completions, sublime.INHIBIT_WORD_COMPLETIONS | sublime.INHIBIT_EXPLICIT_COMPLETIONS)
         else:
             return (completions)
-
-    #def on_activated_async(self, view):
-    #    self.complete_at(view, "", view.sel()[0].begin(), 0)
 
     def on_post_save_async(self, view):
         if not is_supported_language(view): return

@@ -128,8 +128,7 @@ class translation_unit
     return result;
   }
 
-  static std::string to_std_string(CXString str)
-  {
+  static std::string to_std_string(CXString str) {
     std::string result;
     const char * s = clang_getCString(str);
     if (s != nullptr) result = s;
@@ -137,62 +136,48 @@ class translation_unit
     return result;
   }
 
-  struct completion_results
-  {
+  struct completion_results {
     std::shared_ptr<CXCodeCompleteResults> results;
     typedef CXCompletionResult* iterator;
 
-    completion_results(CXCodeCompleteResults* r)
-    {
+    completion_results(CXCodeCompleteResults* r) {
       this->results = std::shared_ptr<CXCodeCompleteResults>(r, &clang_disposeCodeCompleteResults);
     }
 
-    iterator begin()
-    {
+    iterator begin() {
       if (results == nullptr) return nullptr;
       else return results->Results;
     }
 
-    iterator end()
-    {
+    iterator end() {
       if (results == nullptr) return nullptr;
       else return results->Results + results->NumResults;
     }
   };
 
-    template<class F>
-  static void for_each_completion_string(const CXCompletionString& c, F f)
-  {
-    if (clang_getCompletionAvailability(c) == CXAvailability_Available )
-    {
+  template <class F>
+  static void for_each_completion_string(const CXCompletionString& c, const CXCursorKind k, F func) {
+    if (clang_getCompletionAvailability(c) == CXAvailability_Available) {
       int num = clang_getNumCompletionChunks(c);
-      for(int i=0;i<num;i++)
-      {
+      for (int i = 0; i < num; ++i) {
         auto kind = clang_getCompletionChunkKind(c, i);
         if (kind == CXCompletionChunk_Optional) {
-          for_each_completion_string(clang_getCompletionChunkCompletionString(c, i), f);
+          for_each_completion_string(clang_getCompletionChunkCompletionString(c, i), k, func);
         }
         else {
           auto str = clang_getCompletionChunkText(c, i);
-          f(to_std_string(str), kind);
+          func(to_std_string(str), k, kind);
         }
       }
     }
   }
 
-  static std::string get_typed_text(CXCompletionResult& c)
+  template <class F>
+  static void for_each_completion_result(const CXCompletionResult& completion, F func)
   {
-    if ( clang_getCompletionAvailability( c.CompletionString ) == CXAvailability_Available )
-    {
-      int num = clang_getNumCompletionChunks(c.CompletionString);
-      for(int i=0;i<num;i++)
-      {
-        auto str = clang_getCompletionChunkText(c.CompletionString, i);
-        auto kind = clang_getCompletionChunkKind(c.CompletionString, i);
-        if (kind == CXCompletionChunk_TypedText) return to_std_string(str);
-      }
-    }
-    return {};
+    const auto c = completion.CompletionString;
+    const auto k = completion.CursorKind;
+    for_each_completion_string(c, k, func);
   }
 
   completion_results completions_at(unsigned line, unsigned col, const char * buffer, unsigned len)
@@ -357,7 +342,10 @@ public:
       std::stringstream replacement;
 
       std::size_t idx = 1;
-      for_each_completion_string(c.CompletionString, [&](std::string&& text, CXCompletionChunkKind kind) {
+      for_each_completion_result(c, [&](std::string&& text, CXCursorKind ck, CXCompletionChunkKind kind) {
+        if (ck == CXCursor_MacroExpansion)
+          return;
+
         switch(kind) {
           case CXCompletionChunk_LeftParen:
           case CXCompletionChunk_RightParen:
@@ -367,7 +355,6 @@ public:
           case CXCompletionChunk_RightBrace:
           case CXCompletionChunk_LeftAngle:
           case CXCompletionChunk_RightAngle:
-          case CXCompletionChunk_TypedText:
           case CXCompletionChunk_CurrentParameter:
           case CXCompletionChunk_Colon:
           case CXCompletionChunk_Comma:
@@ -376,12 +363,20 @@ public:
             display << text;
             replacement << text;
             break;
+          case CXCompletionChunk_TypedText:
+            display << text;
+            replacement << text;
+            if (ck == CXCursor_Constructor)
+              replacement << " ${" << idx++ << ":v}";
+            break;
           case CXCompletionChunk_Placeholder:
             display << text;
             replacement << "${" << idx++ << ":" << text << "}";
             break;
           case CXCompletionChunk_ResultType:
           case CXCompletionChunk_Text:
+          case CXCompletionChunk_Informative:
+          case CXCompletionChunk_Equal:
             display << text << " ";
             break;
           default:
