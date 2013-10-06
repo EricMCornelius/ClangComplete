@@ -1,9 +1,9 @@
 {
-    "additional_options": ["-Wno-c++11-narrowing", "-D__STRICT_ANSI__", "-DQT_NO_DEBUG", "-isystem",
-                           "-I/usr/include/c++/4.7", "-I/usr/include/c++/4.7/backward", "-I/usr/include/x86_64-linux-gnu/c++/4.7",
-                           "-I/usr/local/include", "-I/usr/local/lib/clang/3.4/include", "-I/usr/include/x86_64-linux-gnu", "-I/usr/include"],
+    "additional_options": ["-std=c++11", "-Wno-c++11-narrowing", "-D__STRICT_ANSI__", "-isystem",
+                           "-I/usr/include/c++/4.8", "-I/usr/include/c++/4.8/backward", "-I/usr/include/x86_64-linux-gnu/c++/4.8",
+                           "-I/usr/lib/llvm-3.4/include", "-I/usr/include/x86_64-linux-gnu", "-I/usr/include"],
     "build_dir": "build",
-    "default_options": ["-std=c++11"],
-    "timeout": 200,
+    "default_options": [],
+    "timeout": 1000,
     "inhibit_sublime_completions": true
 }

@@ -11,8 +11,7 @@ extern "C"
         int argv, 
         unsigned line, 
         unsigned col, 
-        const char * prefix, 
-        int timeout,
+        const char * prefix,
         const char * buffer, 
         unsigned len);
 

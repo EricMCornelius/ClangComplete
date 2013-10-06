@@ -22,13 +22,13 @@ def convert_to_c_string_array(a):
     result[:] = [x.encode('utf-8') for x in a]
     return result
 
-def get_completions(filename, args, line, col, prefix, timeout, unsaved_buffer):
+def get_completions(filename, args, line, col, prefix, unsaved_buffer):
     buffer = None
     if (unsaved_buffer is not None): buffer = unsaved_buffer.encode("utf-8")
     buffer_len = 0
     if (buffer is not None): buffer_len = len(buffer)
 
-    return complete.clang_complete_get_completions(filename.encode('utf-8'), convert_to_c_string_array(args), len(args), line, col, prefix.encode('utf-8'), timeout, buffer, buffer_len)
+    return complete.clang_complete_get_completions(filename.encode('utf-8'), convert_to_c_string_array(args), len(args), line, col, prefix.encode('utf-8'), buffer, buffer_len)
 
 def get_diagnostics(filename, args):
     return complete.clang_complete_get_diagnostics(filename.encode('utf-8'), convert_to_c_string_array(args), len(args))

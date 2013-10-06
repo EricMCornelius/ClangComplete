@@ -23,6 +23,7 @@ def parse_flags(f, pflags=[]):
         if line.startswith('CXX_FLAGS') or line.startswith('CXX_DEFINES'):
             words = line[line.index('=')+1:].split()
             flags.extend([word for word in words if check_include(word)])
+    print(flags)
     return flags
 
 def accumulate_options(path):
@@ -43,7 +44,6 @@ def get_options(project_path, additional_options, build_dir, default_options):
     else:
         project_options[project_path] = ['-x', 'c++'] + default_options + additional_options
 
-    # print(project_path, project_options[project_path])
     return project_options[project_path]
 
 #
@@ -212,7 +212,6 @@ class ClangCompleteClearCache(sublime_plugin.TextCommand):
 
 class ClangCompleteShowUsage(sublime_plugin.TextCommand):
     def run(self, edit):
-        print("Show Usages")
         filename = self.view.file_name()
         # The view hasnt finsished loading yet
         if (filename is None): return
@@ -263,13 +262,13 @@ class ClangCompleteCompletion(sublime_plugin.EventListener):
     def run(self, edit):
         print('Run completion');
 
-    def complete_at(self, view, prefix, location, timeout):
+    def complete_at(self, view, prefix, location):
         filename = view.file_name()
         if not is_supported_language(view):
             return []
 
         row, col = view.rowcol(location - len(prefix))
-        completions = get_completions(filename, get_args(view), row+1, col+1, prefix, timeout, get_unsaved_buffer(view))
+        completions = get_completions(filename, get_args(view), row+1, col+1, prefix, get_unsaved_buffer(view))
 
         return completions;
 
@@ -290,11 +289,10 @@ class ClangCompleteCompletion(sublime_plugin.EventListener):
         if 'delete' in name: return
 
     def on_query_completions(self, view, prefix, locations):
-        print('query completions');
         if not is_supported_language(view):
             return []
 
-        completions = self.complete_at(view, prefix, locations[0], get_setting(view, "timeout", 500))
+        completions = self.complete_at(view, prefix, locations[0])
         if (get_setting(view, "inhibit_sublime_completions", True)):
             return (completions, sublime.INHIBIT_WORD_COMPLETIONS | sublime.INHIBIT_EXPLICIT_COMPLETIONS)
         else:

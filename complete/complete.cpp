@@ -10,6 +10,8 @@
 #include <memory>
 #include <future>
 #include <mutex>
+#include <thread>
+#include <list>
 #include <iterator>
 #include <algorithm>
 #include <unordered_map>
@@ -20,53 +22,59 @@
 
 std::ofstream logger("/home/corneliu/clang_log");
 
-namespace std {
+typedef std::tuple<std::size_t, std::string, std::string> Completion;
 
-string& to_string(string& s) { return s; }
+struct timer {
+  typedef std::chrono::seconds s;
+  typedef std::chrono::microseconds us;
 
-const string& to_string(const string& s) { return s; }
-}
+  timer() : start_time(now()) {}
 
-typedef std::tuple<std::string, std::string> Completion;
+  std::chrono::time_point<std::chrono::system_clock> now() { return std::chrono::system_clock::now(); }
 
-class timer {
-  typedef typename std::conditional<std::chrono::high_resolution_clock::is_steady, std::chrono::high_resolution_clock,
-                                    std::chrono::steady_clock>::type clock_type;
-  typedef std::chrono::milliseconds milliseconds;
+  void start() { start_time = now(); }
 
-public:
-  explicit timer(bool run = false) {
-    if (run) this->reset();
-  }
-  void reset() { this->start = clock_type::now(); }
-  milliseconds elapsed() const { return std::chrono::duration_cast<milliseconds>(clock_type::now() - this->start); }
-  template <typename Stream> friend Stream& operator<<(Stream& out, const timer& self) {
-    return out << self.elapsed().count();
-  }
+  void stop() { stop_time = now(); }
 
-private:
-  clock_type::time_point start;
+  std::size_t count() { return std::chrono::duration_cast<us>(stop_time - start_time).count(); }
+
+  double seconds() { return count() / 1000000.0; }
+
+  std::chrono::time_point<std::chrono::system_clock> start_time;
+  std::chrono::time_point<std::chrono::system_clock> stop_time;
 };
 
-// An improved async, that doesn't block
-template <class Function, class... Args>
-std::future<typename std::result_of<Function(Args...)>::type> detach_async(Function&& f, Args&&... args) {
-  typedef typename std::result_of<Function(Args...)>::type result_type;
-  std::packaged_task<result_type(Args...)> task(std::forward<Function>(f));
-  auto fut = task.get_future();
-  std::thread(std::move(task)).detach();
-  return std::move(fut);
-}
+struct processor {
+  processor()
+    : _thread([this] { this->run(); }) {}
 
-inline bool starts_with(const char* str, const char* pre) {
-  size_t lenpre = strlen(pre), lenstr = strlen(str);
-  return lenstr < lenpre ? false : strncmp(pre, str, lenpre) == 0;
-}
+  template <typename ReturnType> std::future<ReturnType> execute(std::function<ReturnType()>& f) {
+    auto promise = std::make_shared<std::promise<ReturnType>>();
+    _tasks.emplace_back([=] { promise->set_value(f()); });
+    return promise->get_future();
+  }
+
+  void run() {
+    while (true) {
+      if (_tasks.empty()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        continue;
+      }
+
+      auto next = std::move(_tasks.front());
+      _tasks.pop_front();
+      next();
+    }
+  }
+
+  std::thread _thread;
+  std::list<std::function<void()>> _tasks;
+};
 
 inline bool istarts_with(const std::string& str, const std::string& pre) {
   return str.length() < pre.length() ? false : std::equal(pre.begin(), pre.end(), str.begin(), [](char a, char b) {
-    return std::tolower(a) == std::tolower(b);
-  });
+                                                 return std::tolower(a) == std::tolower(b);
+                                               });
 }
 
 std::string get_line_at(const std::string& str, unsigned int line) {
@@ -92,15 +100,13 @@ CXIndex get_index() {
 }
 
 class translation_unit {
-  // CXIndex index;
-  CXTranslationUnit tu;
-  const std::string filename;
-  std::timed_mutex m;
+  CXTranslationUnit _tu;
+  const std::string _filename;
 
-  CXUnsavedFile unsaved_buffer(const char* buffer, unsigned len) {
+  CXUnsavedFile unsaved_buffer(const std::string& buffer, unsigned len) {
     CXUnsavedFile result;
-    result.Filename = this->filename.c_str();
-    result.Contents = buffer;
+    result.Filename = _filename.c_str();
+    result.Contents = buffer.c_str();
     result.Length = len;
     return result;
   }
@@ -114,26 +120,16 @@ class translation_unit {
   }
 
   struct completion_results {
-    std::shared_ptr<CXCodeCompleteResults> results;
+    std::shared_ptr<CXCodeCompleteResults> _results;
     typedef CXCompletionResult* iterator;
 
     completion_results(CXCodeCompleteResults* r) {
-      this->results = std::shared_ptr<CXCodeCompleteResults>(r, &clang_disposeCodeCompleteResults);
+      _results = std::shared_ptr<CXCodeCompleteResults>(r, &clang_disposeCodeCompleteResults);
     }
 
-    iterator begin() {
-      if (results == nullptr)
-        return nullptr;
-      else
-        return results->Results;
-    }
+    iterator begin() { return _results ? _results->Results : nullptr; }
 
-    iterator end() {
-      if (results == nullptr)
-        return nullptr;
-      else
-        return results->Results + results->NumResults;
-    }
+    iterator end() { return _results ? _results->Results + _results->NumResults : nullptr; }
   };
 
   template <class F> static void for_each_completion_string(const CXCompletionString& c, const CXCursorKind k, F func) {
@@ -144,8 +140,8 @@ class translation_unit {
         if (kind == CXCompletionChunk_Optional) {
           for_each_completion_string(clang_getCompletionChunkCompletionString(c, i), k, func);
         } else {
-          auto str = clang_getCompletionChunkText(c, i);
-          func(to_std_string(str), k, kind);
+          auto str = to_std_string(clang_getCompletionChunkText(c, i));
+          func(std::move(str), k, kind);
         }
       }
     }
@@ -157,25 +153,25 @@ class translation_unit {
     for_each_completion_string(c, k, func);
   }
 
-  completion_results completions_at(unsigned line, unsigned col, const char* buffer, unsigned len) {
-    if (buffer == nullptr) {
-      return clang_codeCompleteAt(this->tu, this->filename.c_str(), line, col, nullptr, 0, 0);
+  completion_results completions_at(unsigned line, unsigned col, const std::string& buffer, unsigned len) {
+    if (buffer.empty()) {
+      return clang_codeCompleteAt(_tu, _filename.c_str(), line, col, nullptr, 0, 0);
     } else {
       auto unsaved = this->unsaved_buffer(buffer, len);
-      return clang_codeCompleteAt(this->tu, this->filename.c_str(), line, col, &unsaved, 1, 0);
-    }
-  }
-
-  void unsafe_reparse(const char* buffer = nullptr, unsigned len = 0) {
-    if (buffer == nullptr)
-      clang_reparseTranslationUnit(this->tu, 0, nullptr, clang_defaultReparseOptions(this->tu));
-    else {
-      auto unsaved = this->unsaved_buffer(buffer, len);
-      clang_reparseTranslationUnit(this->tu, 1, &unsaved, clang_defaultReparseOptions(this->tu));
+      return clang_codeCompleteAt(_tu, _filename.c_str(), line, col, &unsaved, 1, 0);
     }
   }
 
 public:
+  void reparse(const std::string& buffer = "", unsigned len = 0) {
+    if (buffer.empty())
+      clang_reparseTranslationUnit(_tu, 0, nullptr, clang_defaultReparseOptions(_tu));
+    else {
+      auto unsaved = this->unsaved_buffer(buffer, len);
+      clang_reparseTranslationUnit(_tu, 1, &unsaved, clang_defaultReparseOptions(_tu));
+    }
+  }
+
   struct cursor {
     CXCursor c;
 
@@ -213,26 +209,21 @@ public:
 
     bool is_null() { return clang_Cursor_isNull(this->c); }
   };
-  translation_unit(const char* filename, const char** args, int argv) : filename(filename) {
-    this->tu = clang_parseTranslationUnit(get_index(), filename, args, argv, NULL, 0,
-                                          clang_defaultEditingTranslationUnitOptions());
-    detach_async([ = ]() {
-      this->reparse();
-    });
+
+  translation_unit(const std::string& filename, const char** args, int argv) : _filename(filename) {
+    timer t;
+    _tu = clang_parseTranslationUnit(get_index(), filename.c_str(), args, argv, nullptr, 0,
+                                     clang_defaultEditingTranslationUnitOptions());
+    t.stop();
+    logger << "Parsed translation unit:" << filename << " in " << t.seconds() << std::endl;
   }
 
   translation_unit(const translation_unit&) = delete;
 
-  cursor get_cursor_at(unsigned long line, unsigned long col, const char* name = nullptr) {
-    if (name == nullptr) name = this->filename.c_str();
-    CXFile f = clang_getFile(this->tu, name);
-    CXSourceLocation loc = clang_getLocation(this->tu, f, line, col);
-    return cursor(clang_getCursor(this->tu, loc));
-  }
-
-  void reparse(const char* buffer = nullptr, unsigned len = 0) {
-    std::lock_guard<std::timed_mutex> lock(this->m);
-    this->unsafe_reparse(buffer, len);
+  cursor get_cursor_at(unsigned long line, unsigned long col) {
+    CXFile f = clang_getFile(_tu, _filename.c_str());
+    CXSourceLocation loc = clang_getLocation(_tu, f, line, col);
+    return cursor(clang_getCursor(_tu, loc));
   }
 
   struct usage {
@@ -252,26 +243,30 @@ public:
   };
 
   std::unordered_map<std::string, unsigned long> get_usage() {
-    std::lock_guard<std::timed_mutex> lock(this->m);
     std::unordered_map<std::string, unsigned long> result;
-    auto u = std::make_shared<usage>(clang_getCXTUResourceUsage(this->tu));
+    auto u = std::make_shared<usage>(clang_getCXTUResourceUsage(_tu));
     for (CXTUResourceUsageEntry e : *u) {
       result.insert(std::make_pair(clang_getTUResourceUsageName(e.kind), e.amount));
     }
     return result;
   }
 
-  std::set<Completion> complete_at(unsigned line, unsigned col, const char* prefix, const char* buffer = nullptr,
-                                   unsigned len = 0) {
-    std::lock_guard<std::timed_mutex> lock(this->m);
+  std::set<Completion> complete_at(unsigned line, unsigned col, const std::string& prefix, const std::string& buffer,
+                                   unsigned len) {
+    this->reparse(buffer, len);
+
     std::set<Completion> results;
     for (auto& c : this->completions_at(line, col, buffer, len)) {
+      auto priority = clang_getCompletionPriority(c.CompletionString);
+
       std::stringstream display;
       std::stringstream replacement;
 
       std::size_t idx = 1;
+      bool matches = true;
       for_each_completion_result(c, [&](std::string && text, CXCursorKind ck, CXCompletionChunkKind kind) {
-        if (ck == CXCursor_MacroExpansion) return;
+        if (ck == CXCursor_MacroExpansion)
+          return;
 
         switch (kind) {
           case CXCompletionChunk_LeftParen:
@@ -291,9 +286,11 @@ public:
             replacement << text;
             break;
           case CXCompletionChunk_TypedText:
+            matches = istarts_with(text, prefix);
             display << text;
             replacement << text;
-            if (ck == CXCursor_Constructor) replacement << " ${" << idx++ << ":v}";
+            if (ck == CXCursor_Constructor)
+              replacement << " ${" << idx++ << ":v}";
             break;
           case CXCompletionChunk_Placeholder:
             display << text;
@@ -309,16 +306,15 @@ public:
             logger << "Kind:" << kind << " Text:" << text << std::endl;
         }
       });
-      results.insert(std::make_tuple(display.str(), replacement.str()));
-      // if (!text.empty() and starts_with(text.c_str(), prefix)) results.insert(text);
+
+      if (!matches) continue;
+
+      auto resp = std::make_tuple(priority, display.str(), replacement.str());
+      if (!std::get<1>(resp).empty() && !std::get<2>(resp).empty()) results.insert(resp);
     }
-    // Perhaps a reparse can help rejuvenate clang?
-    if (results.size() == 0) this->unsafe_reparse(buffer, len);
+
     return results;
   }
-
-  typedef std::shared_ptr<std::remove_pointer<CXDiagnosticSet>::type> DiagnosticSetPtr;
-  typedef std::shared_ptr<std::remove_pointer<CXDiagnostic>::type> DiagnosticPtr;
 
   void process_diagnostic_set(CXDiagnosticSet set, std::vector<std::string>& results, std::size_t depth = 0) {
     const std::size_t indent_size = 2;
@@ -340,27 +336,20 @@ public:
         auto child = clang_getChildDiagnostics(diag);
         if (child) process_diagnostic_set(child, results, depth + 1);
       }
+      clang_disposeDiagnostic(diag);
     }
   }
 
-  std::vector<std::string> get_diagnostics(int timeout = -1) {
-    std::unique_lock<std::timed_mutex> lock(this->m, std::defer_lock);
-    if (timeout < 0) {
-      lock.lock();
-    } else {
-      if (!lock.try_lock_for(std::chrono::milliseconds(timeout))) return {};
-    }
-
+  std::vector<std::string> get_diagnostics() {
     std::vector<std::string> result;
-    auto set = DiagnosticSetPtr(clang_getDiagnosticSetFromTU(this->tu), &clang_disposeDiagnosticSet);
-    process_diagnostic_set(set.get(), result);
-    logger << "Done processing diagnostics" << std::endl;
+    auto set = clang_getDiagnosticSetFromTU(_tu);
+    process_diagnostic_set(set, result);
+    clang_disposeDiagnosticSet(set);
 
     return result;
   }
 
   std::string get_definition(unsigned line, unsigned col) {
-    std::lock_guard<std::timed_mutex> lock(this->m);
     std::string result;
     cursor c = this->get_cursor_at(line, col);
     cursor def = c.get_definition();
@@ -372,106 +361,17 @@ public:
     return result;
   }
 
-  std::string get_type(unsigned line, unsigned col) {
-    std::lock_guard<std::timed_mutex> lock(this->m);
-    return this->get_cursor_at(line, col).get_type_name();
-  }
+  std::string get_type(unsigned line, unsigned col) { return this->get_cursor_at(line, col).get_type_name(); }
 
-  ~translation_unit() {
-    std::lock_guard<std::timed_mutex> lock(this->m);
-    clang_disposeTranslationUnit(this->tu);
-  }
+  ~translation_unit() { clang_disposeTranslationUnit(_tu); }
 };
 
-#ifndef CLANG_COMPLETE_ASYNC_WAIT_MS
-#define CLANG_COMPLETE_ASYNC_WAIT_MS 500
-#endif
+std::unordered_map<std::string, std::shared_ptr<translation_unit>> tus;
 
-class async_translation_unit : public translation_unit {
-
-  struct query {
-    std::future<std::set<Completion>> results_future;
-    std::set<Completion> results;
-    unsigned line;
-    unsigned col;
-
-    query() : line(0), col(0) {}
-
-    std::pair<unsigned, unsigned> get_loc() { return std::make_pair(this->line, this->col); }
-
-    void set(std::future<std::set<Completion>>&& results_future, unsigned line, unsigned col) {
-      this->results = {};
-      this->results_future = std::move(results_future);
-      this->line = line;
-      this->col = col;
-    }
-
-    std::set<Completion> get(int timeout) {
-      if (results_future.valid() and this->ready(timeout)) {
-        this->results = this->results_future.get();
-        // Force another query if completion results are empty
-        if (this->results.size() == 0) std::tie(line, col) = std::make_pair(0, 0);
-      }
-      return this->results;
-    }
-
-    bool ready(int timeout = 10) {
-      if (results_future.valid())
-        return (timeout > 0 and results_future.wait_for(std::chrono::milliseconds(timeout)) ==
-                std::future_status::ready);
-      else
-        return true;
-    }
-  };
-  std::timed_mutex async_mutex;
-  query q;
-
-public:
-  async_translation_unit(const char* filename, const char** args, int argv) : translation_unit(filename, args, argv) {}
-
-  std::set<Completion> async_complete_at(unsigned line, unsigned col, const char* prefix, int timeout,
-                                         const char* buffer = nullptr, unsigned len = 0) {
-    std::unique_lock<std::timed_mutex> lock(this->async_mutex, std::defer_lock);
-    if (!lock.try_lock_for(std::chrono::milliseconds(20))) return {};
-
-    if (std::make_pair(line, col) != q.get_loc()) {
-      // If we are busy with a query, lets avoid making lots of new queries
-      if (not this->q.ready()) return {};
-
-      std::string buffer_as_string(buffer, buffer + len);
-      this->q.set(detach_async([ = ]{
-        auto b = buffer_as_string.c_str();
-        if (buffer == nullptr) b = nullptr;
-        // TODO: Should we always reparse?
-        // else this->reparse(b, len);
-        return this->complete_at(line, col, "", b, buffer_as_string.length());
-      }),
-                  line, col);
-    }
-    auto completions = q.get(timeout);
-    std::set<Completion> results;
-    std::string pre = prefix;
-    std::copy_if(completions.begin(), completions.end(), inserter(results, results.begin()),
-                                                             [&](const std::tuple<std::string, std::string> & x) {
-      return istarts_with(std::get<0>(x), pre);
-    });
-    return results;
-  }
-};
-
-#ifndef CLANG_COMPLETE_MAX_RESULTS
-#define CLANG_COMPLETE_MAX_RESULTS 8192
-#endif
-
-std::timed_mutex tus_mutex;
-std::unordered_map<std::string, std::shared_ptr<async_translation_unit>> tus;
-
-std::shared_ptr<async_translation_unit> get_tu(const char* filename, const char** args, int argv) {
-  std::lock_guard<std::timed_mutex> lock(tus_mutex);
-  if (tus.find(filename) == tus.end()) {
-    tus[filename] = std::make_shared<async_translation_unit>(filename, args, argv);
-  }
-  return tus[filename];
+std::shared_ptr<translation_unit> get_tu(const std::string& filename, const char** args, int argv) {
+  auto& tu = tus[filename];
+  if (!tu) tu = std::make_shared<translation_unit>(filename, args, argv);
+  return tu;
 }
 
 template <class Range> PyObject* export_pylist(const Range& r) {
@@ -488,8 +388,8 @@ template <class Range> PyObject* export_tuple_pylist(const Range& r) {
   PyObject* result = PyList_New(0);
 
   for (const auto& s : r) {
-    PyList_Append(result, PyTuple_Pack(2, PyUnicode_FromString(std::get<0>(s).c_str()),
-                                       PyUnicode_FromString(std::get<1>(s).c_str())));
+    PyList_Append(result, PyTuple_Pack(2, PyUnicode_FromString(std::get<1>(s).c_str()),
+                                       PyUnicode_FromString(std::get<2>(s).c_str())));
   }
 
   return result;
@@ -505,53 +405,114 @@ template <class Range> PyObject* export_pydict_string_ulong(const Range& r) {
   return result;
 }
 
+std::mutex _lock;
+
+PyObject* default_list = PyList_New(0);
+PyObject* default_dict = PyDict_New();
+PyObject* default_str = PyUnicode_FromString("");
+
+processor p;
 extern "C" {
+
 PyObject* clang_complete_get_completions(const char* filename, const char** args, int argv, unsigned line, unsigned col,
-                                         const char* prefix, int timeout, const char* buffer, unsigned len) {
+                                         const char* prefix_, const char* buffer_, unsigned len) {
+  static std::set<Completion> cached;
+  static std::size_t _line = 0;
+  static std::size_t _col = 0;
+
+  if (line == _line && col == _col) {
+    std::lock_guard<std::mutex> g(_lock);
+    return export_tuple_pylist(cached);
+  }
+
+  logger << "get_completions for " << line << ":" << col << std::endl;
+
   auto tu = get_tu(filename, args, argv);
-  return export_tuple_pylist(tu->async_complete_at(line, col, prefix, timeout, buffer, len));
+  auto prefix = std::make_shared<std::string>(prefix_);
+  auto buffer = std::make_shared<std::string>(buffer_);
+
+  std::function<PyObject*()> f = [=] {
+    {
+      std::lock_guard<std::mutex> g(_lock);
+      cached = tu->complete_at(line, col, *prefix, *buffer, len);
+      _line = line;
+      _col = col;
+    }
+
+    logger << "completion for " << line << ":" << col << " is ready" << std::endl;
+    return export_tuple_pylist(cached);
+  };
+
+  auto fut = p.execute(f);
+  if (fut.wait_for(std::chrono::milliseconds(100)) == std::future_status::ready) return fut.get();
+  logger << "timeout" << std::endl;
+  return PyList_New(0);
 }
 
 PyObject* clang_complete_get_diagnostics(const char* filename, const char** args, int argv) {
-  auto tu = get_tu(filename, args, argv);
-  tu->reparse(nullptr, 0);
+  logger << "get_diagnostics" << std::endl;
 
-  return export_pylist(tu->get_diagnostics(250));
+  auto tu = get_tu(filename, args, argv);
+
+  std::function<PyObject*()> f = [=] {
+    tu->reparse();
+    auto res = tu->get_diagnostics();
+    return export_pylist(res);
+  };
+
+  auto fut = p.execute(f);
+  if (fut.wait_for(std::chrono::milliseconds(1000)) == std::future_status::ready) return fut.get();
+  logger << "timeout" << std::endl;
+  return PyList_New(0);
 }
 
 PyObject* clang_complete_get_usage(const char* filename, const char** args, int argv) {
-  auto tu = get_tu(filename, args, argv);
+  logger << "get_usage" << std::endl;
 
-  return export_pydict_string_ulong(tu->get_usage());
+  auto tu = get_tu(filename, args, argv);
+  std::function<PyObject*()> f = [=] {
+    auto usage = tu->get_usage();
+    return export_pydict_string_ulong(usage);
+  };
+
+  auto fut = p.execute(f);
+  if (fut.wait_for(std::chrono::milliseconds(100)) == std::future_status::ready) return fut.get();
+  logger << "timeout" << std::endl;
+  return PyDict_New();
 }
 
 PyObject* clang_complete_get_definition(const char* filename, const char** args, int argv, unsigned line,
                                         unsigned col) {
-  auto tu = get_tu(filename, args, argv);
+  logger << "get_definition" << std::endl;
 
+  auto tu = get_tu(filename, args, argv);
   return PyUnicode_FromString(tu->get_definition(line, col).c_str());
 }
 
 PyObject* clang_complete_get_type(const char* filename, const char** args, int argv, unsigned line, unsigned col) {
-  auto tu = get_tu(filename, args, argv);
+  logger << "get_type" << std::endl;
 
+  auto tu = get_tu(filename, args, argv);
   return PyUnicode_FromString(tu->get_type(line, col).c_str());
 }
 
 void clang_complete_reparse(const char* filename, const char** args, int argv, const char* buffer, unsigned len) {
+  logger << "reparse" << std::endl;
+
   auto tu = get_tu(filename, args, argv);
   tu->reparse();
 }
 
 void clang_complete_free_tu(const char* filename) {
-  std::lock_guard<std::timed_mutex> lock(tus_mutex);
+  logger << "free_tu" << std::endl;
+
   if (tus.find(filename) != tus.end()) {
     tus.erase(filename);
   }
 }
 
 void clang_complete_free_all() {
-  std::lock_guard<std::timed_mutex> lock(tus_mutex);
+  logger << "free_all" << std::endl;
   tus.clear();
 }
 }
