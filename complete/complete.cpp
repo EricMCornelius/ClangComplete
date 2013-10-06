@@ -48,9 +48,14 @@ struct processor {
   processor()
     : _thread([this] { this->run(); }) {}
 
-  template <typename ReturnType> std::future<ReturnType> execute(std::function<ReturnType()>& f) {
-    auto promise = std::make_shared<std::promise<ReturnType>>();
-    _tasks.emplace_back([=] { promise->set_value(f()); });
+  std::future<void> execute(std::function<void()> f) {
+    std::lock_guard<std::mutex> g(_lock);
+    while (_tasks.size() > 2) _tasks.pop_back();
+    auto promise = std::make_shared<std::promise<void>>();
+    _tasks.emplace_back([=] {
+      f();
+      promise->set_value();
+    });
     return promise->get_future();
   }
 
@@ -61,21 +66,20 @@ struct processor {
         continue;
       }
 
-      auto next = std::move(_tasks.front());
-      _tasks.pop_front();
+      std::function<void()> next;
+      {
+        std::lock_guard<std::mutex> g(_lock);
+        next = std::move(_tasks.front());
+        _tasks.pop_front();
+      }
       next();
     }
   }
 
   std::thread _thread;
   std::list<std::function<void()>> _tasks;
+  std::mutex _lock;
 };
-
-inline bool istarts_with(const std::string& str, const std::string& pre) {
-  return str.length() < pre.length() ? false : std::equal(pre.begin(), pre.end(), str.begin(), [](char a, char b) {
-                                                 return std::tolower(a) == std::tolower(b);
-                                               });
-}
 
 std::string get_line_at(const std::string& str, unsigned int line) {
   int n = 1;
@@ -137,9 +141,9 @@ class translation_unit {
       int num = clang_getNumCompletionChunks(c);
       for (int i = 0; i < num; ++i) {
         auto kind = clang_getCompletionChunkKind(c, i);
-        if (kind == CXCompletionChunk_Optional) {
+        if (kind == CXCompletionChunk_Optional)
           for_each_completion_string(clang_getCompletionChunkCompletionString(c, i), k, func);
-        } else {
+        else {
           auto str = to_std_string(clang_getCompletionChunkText(c, i));
           func(std::move(str), k, kind);
         }
@@ -251,9 +255,8 @@ public:
     return result;
   }
 
-  std::set<Completion> complete_at(unsigned line, unsigned col, const std::string& prefix, const std::string& buffer,
-                                   unsigned len) {
-    this->reparse(buffer, len);
+  std::set<Completion> complete_at(unsigned line, unsigned col, const std::string& buffer, unsigned len) {
+    // this->reparse(buffer, len);
 
     std::set<Completion> results;
     for (auto& c : this->completions_at(line, col, buffer, len)) {
@@ -263,7 +266,6 @@ public:
       std::stringstream replacement;
 
       std::size_t idx = 1;
-      bool matches = true;
       for_each_completion_result(c, [&](std::string && text, CXCursorKind ck, CXCompletionChunkKind kind) {
         if (ck == CXCursor_MacroExpansion)
           return;
@@ -286,7 +288,6 @@ public:
             replacement << text;
             break;
           case CXCompletionChunk_TypedText:
-            matches = istarts_with(text, prefix);
             display << text;
             replacement << text;
             if (ck == CXCursor_Constructor)
@@ -306,8 +307,6 @@ public:
             logger << "Kind:" << kind << " Text:" << text << std::endl;
         }
       });
-
-      if (!matches) continue;
 
       auto resp = std::make_tuple(priority, display.str(), replacement.str());
       if (!std::get<1>(resp).empty() && !std::get<2>(resp).empty()) results.insert(resp);
@@ -369,6 +368,8 @@ public:
 std::unordered_map<std::string, std::shared_ptr<translation_unit>> tus;
 
 std::shared_ptr<translation_unit> get_tu(const std::string& filename, const char** args, int argv) {
+  static std::mutex _lookup_lock;
+  std::lock_guard<std::mutex> g(_lookup_lock);
   auto& tu = tus[filename];
   if (!tu) tu = std::make_shared<translation_unit>(filename, args, argv);
   return tu;
@@ -411,40 +412,45 @@ PyObject* default_list = PyList_New(0);
 PyObject* default_dict = PyDict_New();
 PyObject* default_str = PyUnicode_FromString("");
 
+auto last_completion = std::make_shared<std::set<Completion>>();
+auto last_diagnostic = std::make_shared<std::vector<std::string>>();
+auto last_usage = std::make_shared<std::unordered_map<std::string, unsigned long>>();
+auto last_definition = std::make_shared<std::string>();
+auto last_type = std::make_shared<std::string>();
+
 processor p;
 extern "C" {
 
 PyObject* clang_complete_get_completions(const char* filename, const char** args, int argv, unsigned line, unsigned col,
-                                         const char* prefix_, const char* buffer_, unsigned len) {
-  static std::set<Completion> cached;
+                                         const char* buffer_, unsigned len) {
   static std::size_t _line = 0;
   static std::size_t _col = 0;
 
-  if (line == _line && col == _col) {
-    std::lock_guard<std::mutex> g(_lock);
-    return export_tuple_pylist(cached);
-  }
-
   logger << "get_completions for " << line << ":" << col << std::endl;
 
+  {
+    std::lock_guard<std::mutex> g(_lock);
+    if (line == _line && col == _col) return export_tuple_pylist(*last_completion);
+  }
+
   auto tu = get_tu(filename, args, argv);
-  auto prefix = std::make_shared<std::string>(prefix_);
   auto buffer = std::make_shared<std::string>(buffer_);
 
-  std::function<PyObject*()> f = [=] {
+  std::function<void()> f = [=] {
     {
-      std::lock_guard<std::mutex> g(_lock);
-      cached = tu->complete_at(line, col, *prefix, *buffer, len);
-      _line = line;
-      _col = col;
+      auto results = tu->complete_at(line, col, *buffer, len);
+      {
+        std::lock_guard<std::mutex> g(_lock);
+        *last_completion = std::move(results);
+        _line = line;
+        _col = col;
+      }
     }
-
-    logger << "completion for " << line << ":" << col << " is ready" << std::endl;
-    return export_tuple_pylist(cached);
   };
 
   auto fut = p.execute(f);
-  if (fut.wait_for(std::chrono::milliseconds(100)) == std::future_status::ready) return fut.get();
+  if (fut.wait_for(std::chrono::milliseconds(10)) == std::future_status::ready)
+    return export_tuple_pylist(*last_completion);
   logger << "timeout" << std::endl;
   return PyList_New(0);
 }
@@ -454,14 +460,14 @@ PyObject* clang_complete_get_diagnostics(const char* filename, const char** args
 
   auto tu = get_tu(filename, args, argv);
 
-  std::function<PyObject*()> f = [=] {
+  std::function<void()> f = [=] {
     tu->reparse();
-    auto res = tu->get_diagnostics();
-    return export_pylist(res);
+    *last_diagnostic = tu->get_diagnostics();
   };
 
   auto fut = p.execute(f);
-  if (fut.wait_for(std::chrono::milliseconds(1000)) == std::future_status::ready) return fut.get();
+  if (fut.wait_for(std::chrono::milliseconds(1000)) == std::future_status::ready)
+    return export_pylist(*last_diagnostic);
   logger << "timeout" << std::endl;
   return PyList_New(0);
 }
@@ -470,13 +476,11 @@ PyObject* clang_complete_get_usage(const char* filename, const char** args, int 
   logger << "get_usage" << std::endl;
 
   auto tu = get_tu(filename, args, argv);
-  std::function<PyObject*()> f = [=] {
-    auto usage = tu->get_usage();
-    return export_pydict_string_ulong(usage);
-  };
+  std::function<void()> f = [=] { *last_usage = tu->get_usage(); };
 
   auto fut = p.execute(f);
-  if (fut.wait_for(std::chrono::milliseconds(100)) == std::future_status::ready) return fut.get();
+  if (fut.wait_for(std::chrono::milliseconds(100)) == std::future_status::ready)
+    return export_pydict_string_ulong(*last_usage);
   logger << "timeout" << std::endl;
   return PyDict_New();
 }
@@ -486,14 +490,26 @@ PyObject* clang_complete_get_definition(const char* filename, const char** args,
   logger << "get_definition" << std::endl;
 
   auto tu = get_tu(filename, args, argv);
-  return PyUnicode_FromString(tu->get_definition(line, col).c_str());
+  std::function<void()> f = [=] { *last_definition = tu->get_definition(line, col); };
+
+  auto fut = p.execute(f);
+  if (fut.wait_for(std::chrono::milliseconds(100)) == std::future_status::ready)
+    return PyUnicode_FromString(last_definition->c_str());
+  logger << "timeout" << std::endl;
+  return PyUnicode_FromString("");
 }
 
 PyObject* clang_complete_get_type(const char* filename, const char** args, int argv, unsigned line, unsigned col) {
   logger << "get_type" << std::endl;
 
   auto tu = get_tu(filename, args, argv);
-  return PyUnicode_FromString(tu->get_type(line, col).c_str());
+  std::function<void()> f = [=] { *last_type = tu->get_type(line, col); };
+
+  auto fut = p.execute(f);
+  if (fut.wait_for(std::chrono::milliseconds(100)) == std::future_status::ready)
+    return PyUnicode_FromString(last_type->c_str());
+  logger << "timeout" << std::endl;
+  return PyUnicode_FromString("");
 }
 
 void clang_complete_reparse(const char* filename, const char** args, int argv, const char* buffer, unsigned len) {

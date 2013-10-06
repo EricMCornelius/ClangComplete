@@ -10,8 +10,7 @@ extern "C"
         const char ** args, 
         int argv, 
         unsigned line, 
-        unsigned col, 
-        const char * prefix,
+        unsigned col,
         const char * buffer, 
         unsigned len);
 

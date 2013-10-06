@@ -268,7 +268,7 @@ class ClangCompleteCompletion(sublime_plugin.EventListener):
             return []
 
         row, col = view.rowcol(location - len(prefix))
-        completions = get_completions(filename, get_args(view), row+1, col+1, prefix, get_unsaved_buffer(view))
+        completions = get_completions(filename, get_args(view), row+1, col+1, get_unsaved_buffer(view))
 
         return completions;
 
